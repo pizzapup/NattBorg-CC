@@ -10,6 +10,7 @@ import type {
 /** Column keys for table-backed sheet lists. */
 export const SHEET_COL_LABEL = "label";
 export const SHEET_COL_DESCRIPTION = "description";
+export const SHEET_COL_WEIGHT = "weight";
 
 export function extraSheetColId(extraColumnId: string): string {
   return `extra:${extraColumnId}`;
@@ -30,6 +31,7 @@ export function displayColumnFields(table: RollTable, cols: string[]): SchemaFie
     if (c === SHEET_COL_LABEL) return { id: SHEET_COL_LABEL, label: "Result", fieldType: "text" as const };
     if (c === SHEET_COL_DESCRIPTION)
       return { id: SHEET_COL_DESCRIPTION, label: "Note", fieldType: "textarea" as const };
+    if (c === SHEET_COL_WEIGHT) return { id: SHEET_COL_WEIGHT, label: "Weight", fieldType: "number" as const };
     const xid = c.startsWith("extra:") ? c.slice("extra:".length) : c;
     const ec = table.extraColumns?.find((x) => x.id === xid);
     return {
@@ -45,8 +47,10 @@ export function sheetValuesFromTableOption(opt: TableOption, cols: string[]): Re
   for (const c of cols) {
     if (c === SHEET_COL_LABEL) {
       out[SHEET_COL_LABEL] = opt.label;
-    } else if (c === SHEET_COL_DESCRIPTION) {
+    } else     if (c === SHEET_COL_DESCRIPTION) {
       out[SHEET_COL_DESCRIPTION] = opt.description ?? "";
+    } else if (c === SHEET_COL_WEIGHT) {
+      out[SHEET_COL_WEIGHT] = opt.weight ?? 1;
     } else if (c.startsWith("extra:")) {
       const id = c.slice("extra:".length);
       const v = opt.extra?.[id];

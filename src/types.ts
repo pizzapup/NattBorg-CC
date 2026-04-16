@@ -14,11 +14,98 @@ export function sheetListBlockId(listId: string): SheetListSlot {
   return `list:${listId}`;
 }
 
+/** Preset dice pipelines (see <code>random_dice</code>). */
+export type RandomDicePreset = "4d6_drop_lowest" | "3d6" | "2d6_plus_6";
+
+/** One step in a dice pipeline: roll dice, optionally keep a subset, then aggregate. */
+export type DiceRollStage = {
+  dice: number;
+  sides: number;
+  /** Log label; defaults to <code>NdS</code> notation. */
+  label?: string;
+  /**
+   * Which rolled values feed <code>aggregate</code>.
+   * Example: 4d6 drop lowest → <code>highest</code> with <code>k: 3</code> and <code>aggregate: "sum"</code>.
+   */
+  use: { kind: "all" } | { kind: "highest"; k: number } | { kind: "lowest"; k: number };
+  aggregate: "sum" | "min" | "max";
+};
+
+export type DiceBinOp = "add" | "sub" | "mul" | "div";
+
+/**
+ * How to merge dice steps after each stage has produced one number.
+ * - Pair: <code>op(stage[left], stage[right])</code> — use for the first operation.
+ * - Tail: <code>op(runningResult, stage[right])</code> — use for further +/−/×/÷ (chain).
+ */
+export type DiceCombineStep =
+  | { left: number; right: number; op: DiceBinOp }
+  | { right: number; op: DiceBinOp };
+
+/** Multi-step roll; optional combine chain; optional offset at the end. */
+export type DicePipeline = {
+  stages: DiceRollStage[];
+  /**
+   * First entry must be a pair (two stage indices). Further entries omit <code>left</code>
+   * and combine the running value with <code>stage[right]</code>.
+   */
+  combines?: DiceCombineStep[];
+  /** @deprecated Use <code>combines: [{ left, right, op }]</code> instead. */
+  combine?: { left: number; right: number; op: DiceBinOp };
+  postOffset?: number;
+};
+
 /** How stat scores are set at generation time */
 export type StatGenerationMethod =
   | { kind: "fixed_defaults" }
-  | { kind: "nattborg_lesser" }
-  | { kind: "placeholder"; note: string };
+  | { kind: "placeholder"; note: string }
+  | { kind: "standard_array"; values: number[]; description?: string }
+  | {
+      kind: "point_buy";
+      budget: number;
+      minScore?: number;
+      maxScore?: number;
+      /** Cost per final score (e.g. 15 → 9). Omitted = common8–15 point-buy table. */
+      costs?: Partial<Record<number, number>>;
+      /** Player-facing note (e.g. point table prose). */
+      tableDescription?: string;
+      /** For automated generation only: use each row’s default, or sample a legal spread. */
+      autoMode: "use_stat_defaults" | "random_valid";
+    }
+  | {
+      kind: "random_dice";
+      repeatPerStat: boolean;
+      /** Text formula (e.g. <code>4d6kh3</code>); evaluated when set. Otherwise <code>preset</code> / <code>pipeline</code>. */
+      formula?: string;
+      preset?: RandomDicePreset;
+      pipeline?: DicePipeline;
+      description?: string;
+    };
+
+/** How a modifier stat is computed from its paired score stat (runs before dimension modifiers). */
+export type StatModifierDerive =
+  | { kind: "preset"; preset: "dnd_floor" | "identity" | "score_minus_10" }
+  | { kind: "linear"; slope: number; intercept: number }
+  | { kind: "table"; rows: { score: number; modifier: number }[] };
+
+export type StatScoreModifierPair = {
+  scoreStatId: string;
+  modifierStatId: string;
+  derive: StatModifierDerive;
+  /** Printed sheet: show the score in small type next to the modifier, or hide it (modifier-only row). */
+  scoreOnSheet: "subtle" | "hidden";
+};
+
+/**
+ * After base scores are assigned, fill modifier stats from paired score stats.
+ * Runs before dimension modifiers are applied.
+ */
+export type StatPostProcess =
+  | { kind: "none" }
+  | {
+      kind: "score_to_modifier";
+      pairs: StatScoreModifierPair[];
+    };
 
 export type StatDefinition = {
   id: string;
@@ -150,6 +237,19 @@ export type ArchetypeOption = {
   tableRolls?: string[];
   /** Keys into `sharedTraits` (term-definition library) — same entry can appear on several options */
   sharedTraitRefs?: string[];
+  /**
+   * Weighted inventory / loot picks from roll tables (subset randomization, specific row, etc.).
+   * Populated from Studio V2 component options.
+   */
+  inventoryGrants?: {
+    tableId: string;
+    pick: "random" | "specific";
+    /** Match <code>TableOption.extra.entryId</code> when present */
+    entryId?: string;
+    /** Inclusive 0-based indices into <code>table.options</code> */
+    onlyIndices?: number[];
+    excludeIndices?: number[];
+  }[];
   /** Designer-defined columns on the dimension overview (see <code>ArchetypeGroup.optionExtraColumns</code>). */
   extra?: Record<string, string | number>;
 };
@@ -194,6 +294,47 @@ export type ArchetypeGroup = {
  */
 export type TableLibraryKind = "general" | "archetype";
 
+/** Studio V2 roll-table / loot bucket (designer metadata; also copied onto runtime <code>RollTable</code>). */
+export type StudioV2TableCategory = "general" | "inventory" | "weapons";
+
+/** Designer-defined bucket for tables (sheet organization, “Gain a …” pickers). */
+export type StudioV2TableGroup = {
+  id: string;
+  name: string;
+  /** Short noun for UI, e.g. “weapon”, “spell”. */
+  gainLabel?: string;
+};
+
+/**
+ * Character-sheet list block tied to one roll table: which outcome columns appear when list rows reference table outcomes.
+ */
+export type StudioV2SheetTableSection = {
+  id: string;
+  title: string;
+  /** Id of a table in <code>buildingBlocks.tables</code>. */
+  studioTableId: string;
+  showLabel?: boolean;
+  showDescription?: boolean;
+  showWeight?: boolean;
+};
+
+export type StudioV2EmbeddedTableSource = "project_table" | "inline";
+
+/** Optional sub-table on a component instance (e.g. ranger animal companions). */
+export type StudioV2OptionEmbeddedTable = {
+  id: string;
+  name: string;
+  description?: string;
+  /**
+   * <code>chargen_pick_only</code>: roll once at creation; only the chosen row affects the sheet.
+   * <code>sheet_reference</code>: print the full outcome list on the sheet for ongoing reference (no chargen roll).
+   */
+  sheetMode: "chargen_pick_only" | "sheet_reference";
+  source: StudioV2EmbeddedTableSource;
+  projectTableId?: string;
+  inlineEntries?: StudioV2TableEntry[];
+};
+
 export type TableOption = {
   weight?: number;
   label: string;
@@ -222,6 +363,10 @@ export type RollTable = {
    * Optional sidebar section label (e.g. “Automaton”, “Nature”). Tables with the same label are grouped in a collapsible block.
    */
   sidebarCategory?: string;
+  /** Studio V2 category for filtering inventory picks. */
+  studioCategory?: StudioV2TableCategory;
+  /** Studio V2 designer group id (<code>buildingBlocks.tableGroups</code>). */
+  studioTableGroupId?: string;
 };
 
 /** Optional columns on numeric stat tables in the studio (id + start value are always shown). */
@@ -291,12 +436,227 @@ export type SystemDocs = {
   designerNotes?: string;
 };
 
+export type ProjectCreator = {
+  name?: string;
+  contact?: string;
+};
+
+export type StatUsageMode = "modifier_only" | "score_only" | "score_and_modifier";
+
+export type StudioV2Stat = {
+  id: string;
+  name: string;
+  abbreviation?: string;
+  startValue: number;
+  description?: string;
+  usesProficiency?: boolean;
+  custom?: Record<string, string | number>;
+};
+
+export type StudioV2SubStat = {
+  id: string;
+  name: string;
+  parentStatId: string;
+  proficiencyEnabled: boolean;
+  description?: string;
+  custom?: Record<string, string | number>;
+};
+
+export type StudioV2TrackedValue = {
+  id: string;
+  name: string;
+  abbreviation?: string;
+  startValue: number;
+  description?: string;
+  custom?: Record<string, string | number>;
+};
+
+export type StudioV2ProjectOverview = {
+  description: string;
+  creatorName: string;
+  creatorContact: string;
+  tags: string[];
+};
+
+export type StudioV2GenerationMethod =
+  | { kind: "fixed_defaults" }
+  | { kind: "standard_array"; values: number[]; description?: string }
+  | {
+      kind: "point_buy";
+      budget: number;
+      minScore: number;
+      maxScore: number;
+      costs?: Partial<Record<number, number>>;
+      tableDescription?: string;
+      autoMode: "use_stat_defaults" | "random_valid";
+    }
+  | {
+      kind: "random_dice";
+      repeatPerStat: boolean;
+      formula?: string;
+      preset?: RandomDicePreset;
+      pipeline?: DicePipeline;
+      description?: string;
+    };
+
+export type StudioV2GainMode = "any_random" | "range_random" | "specific";
+
+export type StudioV2Effect =
+  | { type: "stat_mod"; statId: string; amount: number }
+  | { type: "resource_mod"; trackedValueId: string; amount: number }
+  | {
+      type: "gain_from_library";
+      libraryId: string;
+      mode: StudioV2GainMode;
+      minIndex?: number;
+      maxIndex?: number;
+      specificEntryId?: string;
+    }
+  | {
+      type: "gain_from_table";
+      tableId: string;
+      mode: StudioV2GainMode;
+      minIndex?: number;
+      maxIndex?: number;
+      specificEntryId?: string;
+    }
+  | { type: "sheet_text"; slot: SheetSlot; text: string };
+
+export type StudioV2LibraryEntry = {
+  id: string;
+  name: string;
+  description?: string;
+  fields?: Record<string, string | number>;
+  effects?: StudioV2Effect[];
+};
+
+export type StudioV2Library = {
+  id: string;
+  name: string;
+  description?: string;
+  /** Loot / gear classification for inventory pick UI */
+  category?: StudioV2TableCategory;
+  /** Optional designer group (weapons, spells, …) for sheet sections and filters */
+  tableGroupId?: string;
+  entries: StudioV2LibraryEntry[];
+};
+
+export type StudioV2TableEntry = {
+  id: string;
+  label: string;
+  weight?: number;
+  description?: string;
+  effects?: StudioV2Effect[];
+};
+
+export type StudioV2Table = {
+  id: string;
+  name: string;
+  description?: string;
+  category?: StudioV2TableCategory;
+  tableGroupId?: string;
+  entries: StudioV2TableEntry[];
+};
+
+/** Reusable trait text referenced from dimension options */
+export type StudioV2TraitDefinition = {
+  id: string;
+  name: string;
+  description?: string;
+  /** Advanced: legacy effect pipeline for this trait */
+  traitEffects?: StudioV2Effect[];
+};
+
+export type StudioV2InventoryGrant = {
+  tableId: string;
+  pick: "random" | "specific";
+  entryId?: string;
+  /** 1-based row list, e.g. <code>1,3,5-8</code> (only these rows participate when random) */
+  onlyRaw?: string;
+  excludeRaw?: string;
+};
+
+export type StudioV2ComponentOption = {
+  id: string;
+  name: string;
+  description?: string;
+  statAdjustEnabled?: boolean;
+  statAdjustments?: Record<string, number>;
+  trackedAdjustEnabled?: boolean;
+  trackedAdjustments?: Record<string, number>;
+  traitRefs?: string[];
+  traitNew?: { name: string; description?: string }[];
+  inventory?: StudioV2InventoryGrant[];
+  embeddedTables?: StudioV2OptionEmbeddedTable[];
+};
+
+export type StudioV2Component = {
+  id: string;
+  name: string;
+  description?: string;
+  options: StudioV2ComponentOption[];
+};
+
+export type StudioV2SheetLayoutConfig = {
+  includedBlocks: string[];
+  customNotes?: string;
+  /** Table-backed sheet list sections (weapons block, spells, …) with column visibility. */
+  tableSections?: StudioV2SheetTableSection[];
+};
+
+export type StudioV2ProjectSettings = {
+  visibility: "private" | "public" | "unpublished";
+  handbookEnabled: boolean;
+  handbookVisibility: "private" | "public" | "unpublished";
+  /** Segment in <code>#play/{slug}</code>; defaults to project id when empty. */
+  publishSlug?: string;
+  /** For private (invite) links: <code>?k=</code> value; generated on first publish if empty. */
+  publishInviteKey?: string;
+};
+
+export type StudioV2Config = {
+  projectOverview: StudioV2ProjectOverview;
+  trackedValues: {
+    generationMethod: StudioV2GenerationMethod;
+    statUsage: StatUsageMode;
+    stats: StudioV2Stat[];
+    subStats: StudioV2SubStat[];
+    otherValues: StudioV2TrackedValue[];
+  };
+  buildingBlocks: {
+    components: StudioV2Component[];
+    traits: StudioV2TraitDefinition[];
+    /** Groups for organizing tables and driving sheet / “Gain a …” UI */
+    tableGroups: StudioV2TableGroup[];
+    libraries: StudioV2Library[];
+    tables: StudioV2Table[];
+  };
+  sheetLayout: StudioV2SheetLayoutConfig;
+  projectSettings: StudioV2ProjectSettings;
+};
+
+/** Created / last-saved timestamps (ISO8601). Set by storage on save. */
+export type RpgSystemProjectMeta = {
+  createdAt: string;
+  updatedAt: string;
+  /** Snapshot revision the working copy is aligned with (save-as or restore). */
+  activeRevision?: number;
+};
+
 export type RpgSystem = {
   id: string;
   name: string;
+  description?: string;
+  creator?: ProjectCreator;
+  tags?: string[];
+  /** First save and last edit times; optional on legacy imports until next save. */
+  projectMeta?: RpgSystemProjectMeta;
+  studioV2?: StudioV2Config;
   /** Character dimensions (any number:0…n). Legacy importers may omit; migration supplies defaults. */
   archetypeGroups: ArchetypeGroup[];
   statGenerationMethod: StatGenerationMethod;
+  /** Optional: map ability-style scores to modifier rows after rolling / array / point-buy. */
+  statPostProcess?: StatPostProcess;
   stats: StatDefinition[];
   resources: ResourceDefinition[];
   /**
@@ -347,6 +707,12 @@ export type GeneratedCharacter = {
   /** In-play reference: full tables marked <code>includeOnCharacterSheet</code> on the system. */
   referenceTables?: GeneratedRollTableReference[];
   rollLog: string[];
+};
+
+/** Options for <code>generateCharacter</code>. */
+export type GenerateCharacterOptions = {
+  /** When true, stat roll log includes dice faces and intermediate steps. */
+  verboseStatRolls?: boolean;
 };
 
 /** @deprecated Use statGenerationMethod */

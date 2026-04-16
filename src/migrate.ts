@@ -11,6 +11,11 @@ import {
   type NumericStatOptionalColumn,
   type ResourceDefinition,
   type RpgSystem,
+  type DiceBinOp,
+  type DiceCombineStep,
+  type DicePipeline,
+  type DiceRollStage,
+  type RandomDicePreset,
   type RollTable,
   type RollTableExtraColumn,
   type SchemaField,
@@ -21,11 +26,22 @@ import {
   type SharedTraitDefinition,
   type StatDefinition,
   type StatGenerationMethod,
+  type StatModifierDerive,
+  type StatPostProcess,
+  type StatScoreModifierPair,
   type StudioExtraColumnBundle,
+  type StudioV2Component,
+  type StudioV2ComponentOption,
+  type StudioV2Config,
+  type StudioV2Effect,
+  type StudioV2OptionEmbeddedTable,
+  type StudioV2TableEntry,
   type TableLibraryKind,
   type TableOption,
   sheetListBlockId,
 } from "./types";
+import { LEGACY_NATTBORG_LESSER_PIPELINE } from "./engine/statGen";
+import { createDefaultStudioV2 } from "./studio/v2";
 
 type LegacyArchetype = ArchetypeOption;
 
@@ -59,6 +75,213 @@ function normalizeSharedTraitsRecord(raw: unknown): RpgSystem["sharedTraits"] {
     out[id] = row;
   }
   return out;
+}
+
+function normalizeProjectTags(raw: unknown): string[] | undefined {
+  if (Array.isArray(raw)) {
+    const out = raw.map((x) => String(x).trim()).filter(Boolean);
+    return out.length ? out : undefined;
+  }
+  if (typeof raw === "string") {
+    const out = raw
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    return out.length ? out : undefined;
+  }
+  return undefined;
+}
+
+function slugifyStudioKey(raw: string, fallback: string): string {
+  const id = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return id || fallback;
+}
+
+function migrateStudioV2OptionShape(raw: unknown): StudioV2ComponentOption {
+  const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const name = String(o.name ?? "Option").trim() || "Option";
+  const id = String(o.id ?? "").trim() || slugifyStudioKey(name, "option");
+  const effects = Array.isArray(o.effects) ? (o.effects as StudioV2Effect[]) : [];
+  const statAdjustments: Record<string, number> = {
+    ...(typeof o.statAdjustments === "object" && o.statAdjustments
+      ? (o.statAdjustments as Record<string, number>)
+      : {}),
+  };
+  const trackedAdjustments: Record<string, number> = {
+    ...(typeof o.trackedAdjustments === "object" && o.trackedAdjustments
+      ? (o.trackedAdjustments as Record<string, number>)
+      : {}),
+  };
+  for (const e of effects) {
+    if (!e || typeof e !== "object") continue;
+    if (e.type === "stat_mod") {
+      const sid = String((e as { statId?: string }).statId ?? "").trim();
+      if (!sid) continue;
+      statAdjustments[sid] = (statAdjustments[sid] ?? 0) + (Number((e as { amount?: number }).amount) || 0);
+    }
+    if (e.type === "resource_mod") {
+      const rid = String((e as { trackedValueId?: string }).trackedValueId ?? "").trim();
+      if (!rid) continue;
+      trackedAdjustments[rid] = (trackedAdjustments[rid] ?? 0) + (Number((e as { amount?: number }).amount) || 0);
+    }
+  }
+  const statAdjustEnabled = Boolean(o.statAdjustEnabled ?? Object.keys(statAdjustments).length);
+  const trackedAdjustEnabled = Boolean(o.trackedAdjustEnabled ?? Object.keys(trackedAdjustments).length);
+  const traitNewRaw = Array.isArray(o.traitNew) ? o.traitNew : [];
+  return {
+    id,
+    name,
+    description: typeof o.description === "string" ? o.description : undefined,
+    statAdjustEnabled,
+    statAdjustments,
+    trackedAdjustEnabled,
+    trackedAdjustments,
+    traitRefs: Array.isArray(o.traitRefs) ? o.traitRefs.map((x) => String(x)) : [],
+    traitNew: traitNewRaw.map((t) => {
+      const tr = (t && typeof t === "object" ? t : {}) as { name?: unknown; description?: unknown };
+      return {
+        name: String(tr.name ?? "").trim() || "Trait",
+        description: typeof tr.description === "string" ? tr.description : undefined,
+      };
+    }),
+    inventory: Array.isArray(o.inventory) ? (o.inventory as StudioV2ComponentOption["inventory"]) : [],
+    embeddedTables: migrateEmbeddedTables(o.embeddedTables),
+  };
+}
+
+function migrateEmbeddedTables(raw: unknown): StudioV2OptionEmbeddedTable[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const out: StudioV2OptionEmbeddedTable[] = [];
+  for (const item of raw) {
+    const e = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+    const name = String(e.name ?? "Table").trim() || "Table";
+    const id = String(e.id ?? "").trim() || slugifyStudioKey(name, "emb");
+    const sheetMode = e.sheetMode === "sheet_reference" ? "sheet_reference" : "chargen_pick_only";
+    const source = e.source === "inline" ? "inline" : "project_table";
+    const projectTableId = typeof e.projectTableId === "string" ? e.projectTableId.trim() || undefined : undefined;
+    let inlineEntries: StudioV2TableEntry[] | undefined;
+    if (Array.isArray(e.inlineEntries)) {
+      inlineEntries = e.inlineEntries.map((row) => {
+        const r = (row && typeof row === "object" ? row : {}) as Record<string, unknown>;
+        const lab = String(r.label ?? "").trim() || "Row";
+        return {
+          id: String(r.id ?? "").trim() || slugifyStudioKey(lab, "row"),
+          label: lab,
+          weight: typeof r.weight === "number" && Number.isFinite(r.weight) ? r.weight : 1,
+          description: typeof r.description === "string" ? r.description : undefined,
+        };
+      });
+    }
+    out.push({
+      id,
+      name,
+      description: typeof e.description === "string" ? e.description : undefined,
+      sheetMode,
+      source,
+      projectTableId,
+      inlineEntries,
+    });
+  }
+  return out.length ? out : undefined;
+}
+
+function migrateStudioV2ComponentShape(raw: unknown): StudioV2Component {
+  const c = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const name = String(c.name ?? "Component").trim() || "Component";
+  const id = String(c.id ?? "").trim() || slugifyStudioKey(name, "component");
+  const options = Array.isArray(c.options) ? c.options.map(migrateStudioV2OptionShape) : [];
+  return {
+    id,
+    name,
+    description: typeof c.description === "string" ? c.description : undefined,
+    options,
+  };
+}
+
+function normalizeStudioV2(raw: unknown): StudioV2Config {
+  const base = createDefaultStudioV2();
+  if (!raw || typeof raw !== "object") return base;
+  const r = raw as Partial<StudioV2Config>;
+  if (r.projectOverview) {
+    base.projectOverview = {
+      description: String(r.projectOverview.description ?? ""),
+      creatorName: String(r.projectOverview.creatorName ?? ""),
+      creatorContact: String(r.projectOverview.creatorContact ?? ""),
+      tags: Array.isArray(r.projectOverview.tags)
+        ? r.projectOverview.tags.map((x) => String(x)).filter(Boolean)
+        : [],
+    };
+  }
+  if (r.trackedValues) {
+    let generationMethod: StudioV2Config["trackedValues"]["generationMethod"] =
+      r.trackedValues.generationMethod && typeof r.trackedValues.generationMethod === "object"
+        ? (r.trackedValues.generationMethod as StudioV2Config["trackedValues"]["generationMethod"])
+        : base.trackedValues.generationMethod;
+    if ((generationMethod as { kind?: string }).kind === "placeholder") {
+      generationMethod = { kind: "fixed_defaults" };
+    }
+    base.trackedValues = {
+      generationMethod,
+      statUsage:
+        r.trackedValues.statUsage === "score_only" ||
+        r.trackedValues.statUsage === "score_and_modifier" ||
+        r.trackedValues.statUsage === "modifier_only"
+          ? r.trackedValues.statUsage
+          : "modifier_only",
+      stats: Array.isArray(r.trackedValues.stats) ? r.trackedValues.stats : [],
+      subStats: Array.isArray(r.trackedValues.subStats) ? r.trackedValues.subStats : [],
+      otherValues: Array.isArray(r.trackedValues.otherValues) ? r.trackedValues.otherValues : [],
+    };
+  }
+  if (r.buildingBlocks) {
+    base.buildingBlocks = {
+      components: Array.isArray(r.buildingBlocks.components)
+        ? r.buildingBlocks.components.map(migrateStudioV2ComponentShape)
+        : [],
+      traits: Array.isArray(r.buildingBlocks.traits) ? r.buildingBlocks.traits : [],
+      tableGroups: Array.isArray(r.buildingBlocks.tableGroups)
+        ? (r.buildingBlocks.tableGroups as StudioV2Config["buildingBlocks"]["tableGroups"])
+        : base.buildingBlocks.tableGroups,
+      libraries: Array.isArray(r.buildingBlocks.libraries) ? r.buildingBlocks.libraries : [],
+      tables: Array.isArray(r.buildingBlocks.tables) ? r.buildingBlocks.tables : [],
+    };
+  }
+  if (r.sheetLayout) {
+    base.sheetLayout = {
+      includedBlocks: Array.isArray(r.sheetLayout.includedBlocks)
+        ? r.sheetLayout.includedBlocks.map((x) => String(x))
+        : base.sheetLayout.includedBlocks,
+      customNotes: String(r.sheetLayout.customNotes ?? ""),
+      tableSections: Array.isArray(r.sheetLayout.tableSections)
+        ? (r.sheetLayout.tableSections as StudioV2Config["sheetLayout"]["tableSections"])
+        : base.sheetLayout.tableSections,
+    };
+  }
+  if (r.projectSettings) {
+    base.projectSettings = {
+      visibility:
+        r.projectSettings.visibility === "public" ||
+        r.projectSettings.visibility === "unpublished"
+          ? r.projectSettings.visibility
+          : "private",
+      handbookEnabled: Boolean(r.projectSettings.handbookEnabled),
+      handbookVisibility:
+        r.projectSettings.handbookVisibility === "public" ||
+        r.projectSettings.handbookVisibility === "private"
+          ? r.projectSettings.handbookVisibility
+          : "unpublished",
+      ...(typeof (r.projectSettings as { publishSlug?: unknown }).publishSlug === "string"
+        ? { publishSlug: String((r.projectSettings as { publishSlug: string }).publishSlug) }
+        : {}),
+      ...(typeof (r.projectSettings as { publishInviteKey?: unknown }).publishInviteKey === "string"
+        ? { publishInviteKey: String((r.projectSettings as { publishInviteKey: string }).publishInviteKey) }
+        : {}),
+    };
+  }
+  return base;
 }
 
 /** Legacy catalog item shape (pre–sheet-lists). */
@@ -406,6 +629,257 @@ function normalizeNumericStatColumns(
   return out;
 }
 
+const RANDOM_PRESET_IDS: RandomDicePreset[] = ["4d6_drop_lowest", "3d6", "2d6_plus_6"];
+
+function normalizeDiceRollStage(raw: unknown): DiceRollStage | null {
+  if (!raw || typeof raw !== "object") return null;
+  const s = raw as Record<string, unknown>;
+  const dice = Math.max(0, Math.floor(Number(s.dice) || 0));
+  const sides = Math.max(1, Math.floor(Number(s.sides) || 1));
+  if (dice === 0) return null;
+  const label = typeof s.label === "string" ? s.label.trim() : undefined;
+  const ag = s.aggregate === "min" || s.aggregate === "max" ? s.aggregate : "sum";
+  let use: DiceRollStage["use"];
+  const u = s.use;
+  if (u && typeof u === "object") {
+    const uk = (u as Record<string, unknown>).kind;
+    if (uk === "highest" || uk === "lowest") {
+      const k = Math.max(1, Math.floor(Number((u as Record<string, unknown>).k) || 1));
+      use = { kind: uk, k };
+    } else use = { kind: "all" };
+  } else use = { kind: "all" };
+  const stage: DiceRollStage = { dice, sides, use, aggregate: ag };
+  if (label) stage.label = label;
+  return stage;
+}
+
+export function normalizeDicePipeline(raw: unknown): DicePipeline | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const p = raw as Record<string, unknown>;
+  const stagesIn = p.stages;
+  if (!Array.isArray(stagesIn)) return undefined;
+  const stages: DiceRollStage[] = [];
+  for (const x of stagesIn) {
+    const st = normalizeDiceRollStage(x);
+    if (st) stages.push(st);
+  }
+  if (!stages.length) return undefined;
+  const out: DicePipeline = { stages };
+  const combArr = p.combines;
+  if (Array.isArray(combArr) && combArr.length > 0) {
+    const list: DiceCombineStep[] = [];
+    for (const x of combArr) {
+      if (!x || typeof x !== "object") continue;
+      const o = x as Record<string, unknown>;
+      const op = o.op;
+      if (op !== "add" && op !== "sub" && op !== "mul" && op !== "div") continue;
+      const right = Math.floor(Number(o.right) || 0);
+      const leftRaw = o.left;
+      const hasLeft =
+        leftRaw !== undefined &&
+        leftRaw !== null &&
+        leftRaw !== "" &&
+        !(typeof leftRaw === "number" && !Number.isFinite(leftRaw));
+      if (hasLeft) {
+        const left = Math.floor(Number(leftRaw) || 0);
+        list.push({ left, right, op: op as DiceBinOp });
+      } else {
+        list.push({ right, op: op as DiceBinOp });
+      }
+    }
+    if (list.length) out.combines = list;
+  }
+  if (!out.combines) {
+    const c = p.combine;
+    if (c && typeof c === "object") {
+      const cr = c as Record<string, unknown>;
+      const op = cr.op;
+      const left = Math.floor(Number(cr.left) || 0);
+      const right = Math.floor(Number(cr.right) || 0);
+      if (op === "add" || op === "sub" || op === "mul" || op === "div") {
+        out.combine = { op, left, right };
+      }
+    }
+  }
+  const po = Number(p.postOffset);
+  if (Number.isFinite(po) && po !== 0) out.postOffset = Math.trunc(po);
+  return out;
+}
+
+function normalizeStatGenerationMethod(raw: unknown): StatGenerationMethod {
+  if (!raw || typeof raw !== "object") {
+    return { kind: "fixed_defaults" };
+  }
+  const m = raw as Record<string, unknown>;
+  const kind = String(m.kind ?? "fixed_defaults");
+
+  if (kind === "fixed_defaults") return { kind: "fixed_defaults" };
+  if (kind === "nattborg_lesser") {
+    return { kind: "random_dice", repeatPerStat: true, pipeline: LEGACY_NATTBORG_LESSER_PIPELINE };
+  }
+  if (kind === "placeholder") {
+    const note = typeof m.note === "string" && m.note.trim() ? m.note.trim() : "Configure later";
+    return { kind: "placeholder", note };
+  }
+  if (kind === "standard_array") {
+    const values = Array.isArray(m.values) ? m.values.map((x) => Math.floor(Number(x) || 0)) : [];
+    const description =
+      typeof m.description === "string" && m.description.trim() ? m.description.trim() : undefined;
+    return description
+      ? { kind: "standard_array", values, description }
+      : { kind: "standard_array", values };
+  }
+  if (kind === "point_buy") {
+    const budget = Math.max(0, Math.floor(Number(m.budget) || 0));
+    const minScore =
+      m.minScore !== undefined ? Math.floor(Number(m.minScore) || 8) : undefined;
+    const maxScore =
+      m.maxScore !== undefined ? Math.floor(Number(m.maxScore) || 15) : undefined;
+    let costs: Partial<Record<number, number>> | undefined;
+    const cRaw = m.costs;
+    if (cRaw && typeof cRaw === "object") {
+      costs = {};
+      for (const [k, v] of Object.entries(cRaw as Record<string, unknown>)) {
+        const score = Math.floor(Number(k) || 0);
+        if (!Number.isFinite(score)) continue;
+        costs[score] = Math.floor(Number(v) || 0);
+      }
+      if (!Object.keys(costs).length) costs = undefined;
+    }
+    const tableDescription =
+      typeof m.tableDescription === "string" && m.tableDescription.trim()
+        ? m.tableDescription.trim()
+        : undefined;
+    const am = m.autoMode === "random_valid" ? "random_valid" : "use_stat_defaults";
+    const row: Extract<StatGenerationMethod, { kind: "point_buy" }> = {
+      kind: "point_buy",
+      budget,
+      autoMode: am,
+    };
+    if (minScore !== undefined) row.minScore = minScore;
+    if (maxScore !== undefined) row.maxScore = maxScore;
+    if (costs) row.costs = costs;
+    if (tableDescription) row.tableDescription = tableDescription;
+    return row;
+  }
+  if (kind === "random_dice") {
+    const repeatPerStat = Boolean(m.repeatPerStat);
+    const description =
+      typeof m.description === "string" && m.description.trim() ? m.description.trim() : undefined;
+    const formula = typeof m.formula === "string" && m.formula.trim() ? m.formula.trim() : undefined;
+    const presetRaw = m.preset;
+    if (presetRaw === "nattborg_lesser") {
+      const pipeline = normalizeDicePipeline(m.pipeline) ?? LEGACY_NATTBORG_LESSER_PIPELINE;
+      return {
+        kind: "random_dice",
+        repeatPerStat,
+        pipeline,
+        ...(description ? { description } : {}),
+      };
+    }
+    const preset =
+      typeof presetRaw === "string" && (RANDOM_PRESET_IDS as readonly string[]).includes(presetRaw)
+        ? (presetRaw as RandomDicePreset)
+        : undefined;
+    const pipeline = normalizeDicePipeline(m.pipeline);
+    const row: Extract<StatGenerationMethod, { kind: "random_dice" }> = {
+      kind: "random_dice",
+      repeatPerStat,
+      ...(formula ? { formula } : {}),
+      ...(preset ? { preset } : {}),
+      ...(pipeline ? { pipeline } : {}),
+      ...(description ? { description } : {}),
+    };
+    if (!row.formula && !row.preset && !row.pipeline) {
+      return { kind: "random_dice", repeatPerStat, preset: "4d6_drop_lowest" };
+    }
+    return row;
+  }
+
+  return { kind: "fixed_defaults" };
+}
+
+function normalizeModifierDerive(raw: unknown): StatModifierDerive | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const d = raw as Record<string, unknown>;
+  const kind = d.kind;
+  if (kind === "preset") {
+    const preset = d.preset;
+    if (preset === "dnd_floor" || preset === "identity" || preset === "score_minus_10")
+      return { kind: "preset", preset };
+    return { kind: "preset", preset: "dnd_floor" };
+  }
+  if (kind === "linear") {
+    const slope = Number(d.slope);
+    const intercept = Number(d.intercept);
+    return {
+      kind: "linear",
+      slope: Number.isFinite(slope) ? slope : 0.5,
+      intercept: Number.isFinite(intercept) ? intercept : -5,
+    };
+  }
+  if (kind === "table" && Array.isArray(d.rows)) {
+    const rows: { score: number; modifier: number }[] = [];
+    for (const r of d.rows) {
+      if (!r || typeof r !== "object") continue;
+      const o = r as Record<string, unknown>;
+      rows.push({
+        score: Math.floor(Number(o.score) || 0),
+        modifier: Math.floor(Number(o.modifier) || 0),
+      });
+    }
+    if (rows.length) return { kind: "table", rows };
+  }
+  return undefined;
+}
+
+function normalizeStatPostProcess(raw: unknown): StatPostProcess | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const p = raw as Record<string, unknown>;
+  const kind = p.kind;
+
+  if (kind === "score_to_modifier") {
+    const pairsRaw = p.pairs;
+    if (!Array.isArray(pairsRaw)) return undefined;
+    const pairs: StatScoreModifierPair[] = [];
+    for (const x of pairsRaw) {
+      if (!x || typeof x !== "object") continue;
+      const o = x as Record<string, unknown>;
+      const scoreStatId = String(o.scoreStatId ?? o.score ?? "").trim();
+      const modifierStatId = String(o.modifierStatId ?? o.modifier ?? "").trim();
+      if (!scoreStatId || !modifierStatId) continue;
+      const derive = normalizeModifierDerive(o.derive) ?? { kind: "preset", preset: "dnd_floor" };
+      const vis = o.scoreOnSheet === "hidden" ? "hidden" : "subtle";
+      pairs.push({ scoreStatId, modifierStatId, derive, scoreOnSheet: vis });
+    }
+    if (!pairs.length) return undefined;
+    return { kind: "score_to_modifier", pairs };
+  }
+
+  if (kind === "dnd_floor_modifier") {
+    const pairsRaw = p.pairs;
+    if (!Array.isArray(pairsRaw)) return undefined;
+    const pairs: StatScoreModifierPair[] = [];
+    for (const x of pairsRaw) {
+      if (!x || typeof x !== "object") continue;
+      const o = x as Record<string, unknown>;
+      const scoreStatId = String(o.scoreStatId ?? o.score ?? "").trim();
+      const modifierStatId = String(o.modifierStatId ?? o.modifier ?? "").trim();
+      if (!scoreStatId || !modifierStatId) continue;
+      pairs.push({
+        scoreStatId,
+        modifierStatId,
+        derive: { kind: "preset", preset: "dnd_floor" },
+        scoreOnSheet: "subtle",
+      });
+    }
+    if (!pairs.length) return undefined;
+    return { kind: "score_to_modifier", pairs };
+  }
+
+  return undefined;
+}
+
 /** Accepts legacy exports (races/classes, nature/background, labels) and returns current shape */
 export function normalizeSystem(raw: unknown): RpgSystem {
   if (!raw || typeof raw !== "object") throw new Error("Invalid system");
@@ -417,12 +891,14 @@ export function normalizeSystem(raw: unknown): RpgSystem {
 
   const stats = normalizeStatEntries(o.stats);
 
-  const statGenerationMethod = (o.statGenerationMethod ??
-    o.abilityScoreMethod ?? { kind: "fixed_defaults" }) as StatGenerationMethod;
+  const statGenerationMethod = normalizeStatGenerationMethod(
+    o.statGenerationMethod ?? o.abilityScoreMethod ?? { kind: "fixed_defaults" }
+  );
+  const statPostProcess = normalizeStatPostProcess(o.statPostProcess);
 
   const defaultResources: ResourceDefinition[] = [
-    { id: "hp", name: "Hit Points", defaultValue: 6 },
-    { id: "devils_luck", name: "Devil's Luck", defaultValue: 0 },
+    { id: "hp", name: "Hit Points", defaultValue: 0 },
+    { id: "gold", name: "Gold", defaultValue: 0 },
   ];
   const resources = Array.isArray(o.resources)
     ? normalizeResourceEntries(o.resources, defaultResources)
@@ -465,12 +941,45 @@ export function normalizeSystem(raw: unknown): RpgSystem {
 
   const stRaw = o.sharedTraits;
   const sharedTraits = normalizeSharedTraitsRecord(stRaw);
+  const description = typeof o.description === "string" ? o.description.trim() : "";
+  const creatorRaw = o.creator;
+  const creator =
+    creatorRaw && typeof creatorRaw === "object"
+      ? {
+          name:
+            typeof (creatorRaw as Record<string, unknown>).name === "string"
+              ? String((creatorRaw as Record<string, unknown>).name).trim()
+              : undefined,
+          contact:
+            typeof (creatorRaw as Record<string, unknown>).contact === "string"
+              ? String((creatorRaw as Record<string, unknown>).contact).trim()
+              : undefined,
+        }
+      : undefined;
+  const tags = normalizeProjectTags(o.tags);
+
+  const pmRaw = o.projectMeta;
+  let projectMeta: RpgSystem["projectMeta"] | undefined;
+  if (pmRaw && typeof pmRaw === "object") {
+    const p = pmRaw as Record<string, unknown>;
+    const c = typeof p.createdAt === "string" ? p.createdAt.trim() : "";
+    const u = typeof p.updatedAt === "string" ? p.updatedAt.trim() : "";
+    const ar = p.activeRevision;
+    const activeRevision = typeof ar === "number" && Number.isFinite(ar) && ar >= 1 ? Math.floor(ar) : undefined;
+    if (c && u) projectMeta = { createdAt: c, updatedAt: u, ...(activeRevision != null ? { activeRevision } : {}) };
+    else if (c) projectMeta = { createdAt: c, updatedAt: c, ...(activeRevision != null ? { activeRevision } : {}) };
+  }
 
   const out: RpgSystem = {
     id,
     name,
+    ...(description ? { description } : {}),
+    ...(creator && (creator.name || creator.contact) ? { creator } : {}),
+    ...(tags?.length ? { tags } : {}),
+    ...(projectMeta ? { projectMeta } : {}),
     archetypeGroups,
     statGenerationMethod,
+    ...(statPostProcess ? { statPostProcess } : {}),
     stats,
     resources,
     sheetLists,
@@ -480,6 +989,7 @@ export function normalizeSystem(raw: unknown): RpgSystem {
     systemDocs,
     ...(numericStatColumns && Object.keys(numericStatColumns).length ? { numericStatColumns } : {}),
     ...(studioExtraColumns ? { studioExtraColumns } : {}),
+    studioV2: normalizeStudioV2(o.studioV2),
   };
   synchronizeRollTableLibraryMeta(out);
   return out;

@@ -5,18 +5,20 @@ import type {
   GeneratedBlock,
   GeneratedCharacter,
   GeneratedRollTableReference,
+  GenerateCharacterOptions,
   ModifierScope,
   RpgSystem,
+  ResourceModifier,
   SheetListEntry,
   SheetSlot,
   StatModifier,
-  ResourceModifier,
 } from "../types";
 import { sheetListBlockId } from "../types";
 import { getSheetListFields, resolveSheetListEntry } from "../sheetListCore";
 import { normalizeStartingGear } from "../migrate";
-import { rollNattBorgAbility } from "./dice";
-import { rollTableOption } from "./roll";
+import { applyStatGeneration, applyStatPostProcess } from "./statGen";
+import { rollTableOption, rollTableOptionSubset } from "./roll";
+import { applyStudioV2ToSystem } from "../studio/v2";
 
 function pushLine(blocks: Map<SheetSlot, GeneratedBlock>, slot: SheetSlot, line: string) {
   let b = blocks.get(slot);
@@ -260,6 +262,65 @@ function rollOptionTables(
   }
 }
 
+function rollInventoryGrants(
+  sys: RpgSystem,
+  opt: ArchetypeOption,
+  sourcePrefix: string,
+  statBreakdown: StatModifier[],
+  resourceBreakdown: ResourceModifier[],
+  statValues: Record<string, number>,
+  resourceValues: Record<string, number>,
+  blocks: Map<SheetSlot, GeneratedBlock>,
+  rollLog: string[]
+) {
+  for (const g of opt.inventoryGrants ?? []) {
+    const table = sys.tables[g.tableId];
+    if (!table) {
+      rollLog.push(`[${opt.name}] inventory: missing table ${g.tableId}`);
+      continue;
+    }
+    const subset =
+      g.onlyIndices?.length || g.excludeIndices?.length
+        ? {
+            onlyIndices: g.onlyIndices?.length ? new Set(g.onlyIndices) : undefined,
+            excludeIndices: g.excludeIndices?.length ? new Set(g.excludeIndices) : undefined,
+          }
+        : undefined;
+
+    if (g.pick === "specific" && g.entryId) {
+      const idx = table.options.findIndex((o) => String(o.extra?.entryId ?? "") === g.entryId);
+      if (idx < 0) {
+        rollLog.push(`[${opt.name}] inventory: no row with id ${g.entryId} in ${table.name}`);
+        continue;
+      }
+      const option = table.options[idx];
+      const source = `${sourcePrefix}: ${opt.name} — ${table.name} (specific)`;
+      rollLog.push(`Inventory "${table.name}": ${option.label} (specific #${idx + 1})`);
+      const desc = option.description?.trim();
+      if (desc) pushLine(blocks, "description", `${table.name}: ${option.label}. ${desc}`);
+      else pushLine(blocks, "description", `${table.name}: ${option.label}`);
+      for (const e of option.effects ?? []) {
+        applyEffect(sys, e, source, statBreakdown, resourceBreakdown, statValues, resourceValues, blocks, rollLog, 1);
+      }
+      continue;
+    }
+
+    try {
+      const { option, index } = rollTableOptionSubset(table, subset);
+      const source = `${sourcePrefix}: ${opt.name} — ${table.name}`;
+      rollLog.push(`Inventory "${table.name}": ${option.label} (#${index + 1}/${table.options.length})`);
+      const desc = option.description?.trim();
+      if (desc) pushLine(blocks, "description", `${table.name}: ${option.label}. ${desc}`);
+      else pushLine(blocks, "description", `${table.name}: ${option.label}`);
+      for (const e of option.effects ?? []) {
+        applyEffect(sys, e, source, statBreakdown, resourceBreakdown, statValues, resourceValues, blocks, rollLog, 1);
+      }
+    } catch (e) {
+      rollLog.push(`[${opt.name}] inventory: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+}
+
 function applyOptionBase(
   opt: ArchetypeOption,
   groupLabel: string,
@@ -301,8 +362,9 @@ export function resolveArchetypeSelections(
   sys: RpgSystem,
   locks: Record<string, string>
 ): Record<string, ArchetypeOption> {
+  const runtimeSystem = applyStudioV2ToSystem(structuredClone(sys));
   const out: Record<string, ArchetypeOption> = {};
-  for (const g of sys.archetypeGroups) {
+  for (const g of runtimeSystem.archetypeGroups) {
     if (g.options.length === 0) {
       throw new Error(`Archetype group "${g.label}" has no options`);
     }
@@ -343,10 +405,12 @@ function buildReferenceTables(sys: RpgSystem): GeneratedRollTableReference[] {
 
 export function generateCharacter(
   sys: RpgSystem,
-  selectionsByGroupId: Record<string, ArchetypeOption>
+  selectionsByGroupId: Record<string, ArchetypeOption>,
+  options?: GenerateCharacterOptions
 ): GeneratedCharacter {
+  const runtimeSystem = applyStudioV2ToSystem(structuredClone(sys));
   const archetypePicks: ArchetypePick[] = [];
-  for (const g of sys.archetypeGroups) {
+  for (const g of runtimeSystem.archetypeGroups) {
     const opt = selectionsByGroupId[g.id];
     if (!opt) throw new Error(`Missing selection for group "${g.label}" (${g.id})`);
     archetypePicks.push({ groupId: g.id, groupLabel: g.label, option: opt });
@@ -356,47 +420,14 @@ export function generateCharacter(
   const statBreakdown: StatModifier[] = [];
   const resourceValues: Record<string, number> = {};
   const resourceBreakdown: ResourceModifier[] = [];
-  const statRollLog: string[] = [];
+  const verboseStats = options?.verboseStatRolls ?? false;
+  const gen = applyStatGeneration(runtimeSystem, runtimeSystem.statGenerationMethod, verboseStats);
+  Object.assign(statValues, gen.statValues);
+  statBreakdown.push(...gen.statBreakdown);
+  const statRollLog = gen.statRollLog;
+  applyStatPostProcess(statValues, statBreakdown, runtimeSystem.statPostProcess);
 
-  const method = sys.statGenerationMethod.kind;
-  if (method === "fixed_defaults") {
-    for (const s of sys.stats) {
-      statValues[s.id] = s.defaultValue;
-      statBreakdown.push({
-        statId: s.id,
-        amount: s.defaultValue,
-        source: "Starting value",
-        scope: perm,
-      });
-    }
-  } else if (method === "nattborg_lesser") {
-    for (const s of sys.stats) {
-      const { value, detail } = rollNattBorgAbility(s.name);
-      statValues[s.id] = value;
-      statRollLog.push(detail);
-      statBreakdown.push({
-        statId: s.id,
-        amount: value,
-        source: "Rolled (NattBorg lesser)",
-        scope: perm,
-      });
-    }
-  } else {
-    for (const s of sys.stats) {
-      statValues[s.id] = s.defaultValue;
-      statBreakdown.push({
-        statId: s.id,
-        amount: s.defaultValue,
-        source: "Placeholder method — using defaults",
-        scope: perm,
-      });
-    }
-    statRollLog.push(
-      `Stat method: ${(sys.statGenerationMethod as { kind: string }).kind} (${(sys.statGenerationMethod as { note?: string }).note ?? ""})`
-    );
-  }
-
-  for (const r of sys.resources) {
+  for (const r of runtimeSystem.resources) {
     resourceValues[r.id] = r.defaultValue;
     resourceBreakdown.push({
       resourceId: r.id,
@@ -419,9 +450,20 @@ export function generateCharacter(
       resourceValues,
       blocks
     );
-    applySharedTraitRefs(sys, pick.option, blocks);
+    applySharedTraitRefs(runtimeSystem, pick.option, blocks);
     rollOptionTables(
-      sys,
+      runtimeSystem,
+      pick.option,
+      pick.groupLabel,
+      statBreakdown,
+      resourceBreakdown,
+      statValues,
+      resourceValues,
+      blocks,
+      rollLog
+    );
+    rollInventoryGrants(
+      runtimeSystem,
       pick.option,
       pick.groupLabel,
       statBreakdown,
@@ -433,10 +475,10 @@ export function generateCharacter(
     );
   }
 
-  const gear = normalizeStartingGear(sys.startingGear);
+  const gear = normalizeStartingGear(runtimeSystem.startingGear);
   if (gear?.enabled && gear.loadout?.length) {
     for (const pick of gear.loadout) {
-      const table = sys.tables[pick.tableId];
+      const table = runtimeSystem.tables[pick.tableId];
       if (!table) {
         rollLog.push(`[starting loadout] missing table: ${pick.tableId}`);
         continue;
@@ -452,22 +494,22 @@ export function generateCharacter(
         if (desc) pushLine(blocks, "description", `${option.label}: ${desc}`);
         else pushLine(blocks, "description", option.label);
         for (const e of option.effects ?? []) {
-          applyEffect(sys, e, src, statBreakdown, resourceBreakdown, statValues, resourceValues, blocks, rollLog, 1);
+          applyEffect(runtimeSystem, e, src, statBreakdown, resourceBreakdown, statValues, resourceValues, blocks, rollLog, 1);
         }
       }
     }
   }
 
-  const orderedSlots = orderedSheetSlots(sys);
+  const orderedSlots = orderedSheetSlots(runtimeSystem);
   const blocksArr = orderedSlots
     .map((slot) => blocks.get(slot))
     .filter((b): b is GeneratedBlock => Boolean(b && b.lines.length > 0));
 
-  const referenceTables = buildReferenceTables(sys);
+  const referenceTables = buildReferenceTables(runtimeSystem);
 
   return {
-    systemId: sys.id,
-    systemName: sys.name,
+    systemId: runtimeSystem.id,
+    systemName: runtimeSystem.name,
     archetypePicks,
     stats: statValues,
     resources: resourceValues,

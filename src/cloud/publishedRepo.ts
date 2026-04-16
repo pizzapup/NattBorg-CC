@@ -4,7 +4,7 @@ import { normalizeSystem } from "../migrate";
 
 export type PublishVisibility = "public" | "unlisted" | "invite";
 
-function normalizeSlug(raw: string): string {
+export function normalizePublishSlug(raw: string): string {
   return raw
     .trim()
     .toLowerCase()
@@ -17,7 +17,7 @@ export async function fetchPublishedPayload(slug: string, inviteSecret: string):
   const sb = getSupabase();
   if (!sb) return null;
   const { data, error } = await sb.rpc("fetch_published_generator", {
-    p_slug: normalizeSlug(slug),
+    p_slug: normalizePublishSlug(slug),
     p_secret: inviteSecret ?? "",
   });
   if (error) throw new Error(error.message);
@@ -55,10 +55,12 @@ export async function upsertPublishedGenerator(opts: {
   slug: string;
   payload: RpgSystem;
   visibility: PublishVisibility;
+  /** When visibility is <code>invite</code>: use this secret if non-empty; otherwise keep existing or generate. */
+  inviteSecret?: string | null;
 }): Promise<{ slug: string; inviteSecret: string | null }> {
   const sb = getSupabase();
   if (!sb) throw new Error("Cloud not configured");
-  const cleanSlug = normalizeSlug(opts.slug);
+  const cleanSlug = normalizePublishSlug(opts.slug);
   if (!cleanSlug) throw new Error("Choose a URL slug using letters, numbers, and hyphens.");
   const normalized = normalizeSystem(structuredClone(opts.payload));
 
@@ -72,8 +74,13 @@ export async function upsertPublishedGenerator(opts: {
 
   let inviteSecret: string | null = null;
   if (opts.visibility === "invite") {
-    const prev = (existing?.invite_secret as string | null) ?? null;
-    inviteSecret = prev && prev.length > 0 ? prev : crypto.randomUUID().replace(/-/g, "");
+    const explicit = opts.inviteSecret?.trim();
+    if (explicit) {
+      inviteSecret = explicit;
+    } else {
+      const prev = (existing?.invite_secret as string | null) ?? null;
+      inviteSecret = prev && prev.length > 0 ? prev : crypto.randomUUID().replace(/-/g, "");
+    }
   }
 
   const base = {
@@ -104,6 +111,6 @@ export async function deletePublishedGenerator(userId: string, slug: string): Pr
     .from("published_generators")
     .delete()
     .eq("user_id", userId)
-    .eq("slug", normalizeSlug(slug));
+    .eq("slug", normalizePublishSlug(slug));
   if (error) throw new Error(error.message);
 }

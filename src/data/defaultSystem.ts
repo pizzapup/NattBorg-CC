@@ -1,9 +1,14 @@
 import type { RpgSystem } from "../types";
+import { createDefaultStudioV2 } from "../studio/v2";
 
 /** Generic fantasy-flavored starter: classic six abilities, ancestry + class, starter gear — replace or extend for any setting. */
 export const DEFAULT_SYSTEM: RpgSystem = {
   id: "generic_rpg",
   name: "Generic fantasy RPG (starter)",
+  description: "A starter project that demonstrates dimensions, tracked values, libraries, and effects.",
+  creator: { name: "", contact: "" },
+  tags: ["fantasy", "starter"],
+  studioV2: createDefaultStudioV2(),
   archetypeGroups: [
     {
       id: "ancestry",
@@ -102,14 +107,14 @@ export const DEFAULT_SYSTEM: RpgSystem = {
     {
       id: "hp",
       name: "Hit points",
-      defaultValue: 10,
+      defaultValue: 0,
       sheetExplanation: "Injury buffer; tie max HP to class and CON in your rules.",
     },
     {
-      id: "mp",
-      name: "Spell points",
+      id: "gold",
+      name: "Gold",
       defaultValue: 0,
-      sheetExplanation: "Optional pool for spells or special abilities; ignore if unused.",
+      sheetExplanation: "Starting currency. Keep this, rename it, or swap it for your own economy pool.",
     },
   ],
   sharedTraits: {

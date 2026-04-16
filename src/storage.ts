@@ -3,6 +3,7 @@ import { DEFAULT_SYSTEM } from "./data/defaultSystem";
 import { normalizeSystem } from "./migrate";
 import { supabaseConfigured } from "./lib/env";
 import { deleteDesignerSystemRow, listDesignerSystems, upsertDesignerSystem } from "./cloud/systemsRepo";
+import { deleteProjectVersionsForProject } from "./projectVersions";
 
 const KEY = "rpg-gen-systems-v1";
 
@@ -141,6 +142,13 @@ export function getSystem(id: string): RpgSystem | undefined {
 export function saveSystem(system: RpgSystem): void {
   if (system.id === DEFAULT_SYSTEM.id) return;
   const normalized = normalizeSystem(structuredClone(system));
+  const t = new Date().toISOString();
+  const pm = normalized.projectMeta;
+  normalized.projectMeta = {
+    createdAt: pm?.createdAt?.trim() || t,
+    updatedAt: t,
+    ...(pm?.activeRevision != null ? { activeRevision: pm.activeRevision } : {}),
+  };
   customCache[normalized.id] = normalized;
   persistLocalMirror();
   scheduleCloudUpsert(normalized);
@@ -149,6 +157,7 @@ export function saveSystem(system: RpgSystem): void {
 export function deleteSystem(id: string): void {
   if (id === DEFAULT_SYSTEM.id) return;
   delete customCache[id];
+  deleteProjectVersionsForProject(id);
   persistLocalMirror();
   const uid = cloudUserId;
   if (uid && supabaseConfigured()) {
